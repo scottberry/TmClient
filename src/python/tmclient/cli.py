@@ -1,4 +1,4 @@
-# Copyright 2016 Markus D. Herrmann, University of Zurich
+# Copyright 2016, 2018 University of Zurich.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -590,6 +590,26 @@ microscope_file_upload_parser = microscope_file_subparsers.add_parser(
 )
 microscope_file_upload_parser.add_argument(
     'path', help='path to file or directory to upload'
+)
+microscope_file_upload_parser.add_argument(
+    '--convert', dest='convert', nargs='?', metavar='FMT',
+    action='store', default=None, const='png',
+    choices=['png', 'jpeg', 'tif'],
+    help=(
+        "Convert files to the specified format during upload."
+        " The format is specified by giving the converted file's"
+        " extension, e.g., `png`, `jpeg`, etc."
+        " If `--convert` is given without specifying a format,"
+        " images files will be converted to PNG."
+        " The conversion process depends on the availability"
+        " of ImageMagick's `convert` program -- if it cannot"
+        " be executed, file upload will fail."
+    )
+)
+microscope_file_upload_parser.add_argument(
+    '--delete', dest='delete_after_upload',
+    action='store_true', default=False,
+    help=('Delete files after uploading. USE WITH CAUTION!')
 )
 microscope_file_upload_parser.add_argument(
     '--directory', dest='_deprecated_directory_option',

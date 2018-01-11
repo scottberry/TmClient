@@ -1,4 +1,4 @@
-# Copyright 2016 Markus D. Herrmann, University of Zurich
+# Copyright 2016-2018 University of Zurich
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ try:
     from cStringIO import StringIO
 except ImportError:
     from io import StringIO
+from subprocess import check_call, check_output, CalledProcessError
 
 import requests
 import yaml
@@ -41,6 +42,57 @@ from tmclient.auth import prompt_for_credentials, load_credentials_from_file
 
 
 logger = logging.getLogger(__name__)
+
+
+def replace_ext(filename, ext):
+    """
+    Return new pathname formed by replacing extension in `filename` with `ext`.
+    """
+    if ext.startswith('.'):
+        ext = ext[1:]
+    stem, _ = os.path.splitext(filename)
+    return (stem + '.' + ext)
+
+
+def check_imagemagick_supported_format(fmt):
+    """
+    Return ``True`` if `convert` can be run and reports supporting image format `fmt`.
+    """
+    try:
+        convert_output = check_output(['convert', '--version'])
+    # `subprocess` raises `OSError` if the executable is not found
+    except (CalledProcessError, OSError) as err:
+        logger.error(
+            "Cannot run ImageMgick's `convert` program."
+            " On Debian/Ubuntu, use `sudo apt-get install imagemagick`"
+            " to install it.")
+        return False
+    # example `convert --version` output::
+    #
+    #     $ convert --version
+    #     Version: ImageMagick 6.9.7-4 Q16 x86_64 20170114 http://www.imagemagick.org
+    #     Copyright: © 1999-2017 ImageMagick Studio LLC
+    #     License: http://www.imagemagick.org/script/license.php
+    #     Features: Cipher DPC Modules OpenMP
+    #     Delegates (built-in): bzlib djvu fftw fontconfig freetype jbig jng jpeg lcms lqr ltdl lzma openexr pangocairo png tiff wmf x xml zlib
+    #
+    # the following loop will make it such that::
+    #
+    #     supported = ['bzlib', 'djvu', ...]
+    #
+    supported = []
+    for line in convert_output.split('\n'):
+        line = line.lower()
+        if line.startswith('delegates'):
+            supported += line.split(':', 1)[1].split()
+    # this test relies on `fmt` being the file extension *and*
+    # ImageMagick's name for the format; hence we must ensure we use
+    # e.g. `.jpeg` for JPEG files instead of `.jpg`
+    if fmt.lower() in supported:
+        return True
+    else:
+        logger.error("Format `%s` no in ImageMagick's `convert` delegates.")
+        return False
 
 
 class TmClient(HttpClient):
@@ -1013,6 +1065,7 @@ class TmClient(HttpClient):
 
     def upload_microscope_files(self, plate_name, acquisition_name,
                                 path, parallel=1, retry=5,
+                                convert=None, delete_after_upload=False,
                                 _deprecated_directory_option=False):
         '''
         Uploads microscope files contained in `path`.
@@ -1029,6 +1082,15 @@ class TmClient(HttpClient):
             are located
         parallel: int
             number of parallel processes to use for upload
+        retry: int
+            number of times to retry failed uploads
+        convert: str
+            Format to convert images to during the upload process.
+            Given as a string specifying the new file extension (e.g.,
+            ``png`` or ``jpg``).  If ``None`` or the empty string,
+            no conversion takes place and files are uploaded as-is.
+        delete_after_upload: bool
+            Delete source files after successful upload.
 
         Returns
         -------
@@ -1051,6 +1113,13 @@ class TmClient(HttpClient):
             'and acquisition "%s"',
             self.experiment_name, plate_name, acquisition_name
         )
+        if convert:
+            if not check_imagemagick_supported_format(convert):
+                logger.fatal(
+                    "Aborting: conversion requested"
+                    " but ImageMagick's `convert` not available.")
+                return -1
+            logger.info("files will be converted to %s format", convert)
         acquisition_id = self._get_acquisition_id(plate_name, acquisition_name)
 
         path = os.path.expandvars(os.path.expanduser(path))
@@ -1066,8 +1135,14 @@ class TmClient(HttpClient):
         else:
             filenames = [ os.path.basename(path) ]
             paths = [ path ]
+        if convert:
+            filenames_to_register = [
+                replace_ext(filename, convert) for filename in filenames
+            ]
+        else:
+            filenames_to_register = filenames
         registered_filenames = self._register_files_for_upload(
-            acquisition_id, filenames
+            acquisition_id, filenames_to_register
         )
         logger.info('registered %d files', len(registered_filenames))
 
@@ -1080,7 +1155,7 @@ class TmClient(HttpClient):
         while retry > 0:
             work = [
                 # function,         *args ...
-                (self._upload_file, upload_url, path)
+                (self._upload_file, upload_url, path, convert, delete_after_upload)
                 for path in paths
             ]
             outcome = self._parallelize(work, parallel)
@@ -1111,15 +1186,42 @@ class TmClient(HttpClient):
         res.raise_for_status()
         return res.json()['data']
 
-    def _upload_file(self, upload_url, filepath):
-        logger.debug('uploading file `%s` ...', filepath)
-        with open(filepath, 'rb') as stream:
+    def _upload_file(self, upload_url, filepath,
+                     convert=None, delete=False):
+        if convert:
+            file_to_upload = replace_ext(filepath, convert)
+            logger.debug(
+                'converting source file `%s` to `%s` (%s format) ...',
+                filepath, file_to_upload, convert)
+            check_call(
+                ['convert', filepath, '-depth', '16',
+                 '-colorspace', 'gray', file_to_upload])
+        else:
+            file_to_upload = filepath
+        logger.debug('uploading file `%s` ...', file_to_upload)
+        with open(file_to_upload, 'rb') as stream:
             files = {'file': stream}
             res = self._session.post(upload_url, files=files)
+        if convert and (filepath != file_to_upload):
+            try:
+                os.remove(file_to_upload)
+            except Exception as err:
+                logger.warn(
+                    "Cannot delete temporary file `%s`: %s",
+                    file_to_upload, err)
         if res.ok:
             logger.debug(
                 'successfully uploaded file `%s`, elapsed %.3fs',
                 filepath, res.elapsed.total_seconds())
+            if delete:
+                try:
+                    os.remove(filepath)
+                    logger.debug(
+                        "deleted successfully uploaded file `%s`",
+                        filepath)
+                except Exception as err:
+                    logger.warn("Could not remove file `%s`: %s",
+                                filepath, err)
             return (True, filepath)
         else:
             logger.error('upload of file `%s` failed: %d %s',
